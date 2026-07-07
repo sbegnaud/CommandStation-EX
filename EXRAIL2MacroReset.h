@@ -172,6 +172,7 @@
 #undef READ_LOCO 
 #undef RED 
 #undef RESERVE 
+#undef SRESERVE
 #undef RESET 
 #undef RESTORE_SPEED
 #undef RESUME 

@@ -613,6 +613,10 @@
 #define RESERVE(token_id)
 ///brief Waits for token for block. If not available immediately, current task loco is stopped.
 
+#define SRESERVE(token_id)
+///brief Waits for token for block. If not available immediately, current task loco is stopped.
+
+
 #define RESET(vpin,count...)
 ///brief Sets output pin LOW
 ///see SET

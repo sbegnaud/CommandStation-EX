@@ -710,6 +710,15 @@ void RMFT2::loop2() {
     }
     setFlag(operand,SECTION_FLAG);
     break;
+
+     case OPCODE_SRESERVE:
+    if (getFlag(operand,SECTION_FLAG)) {
+      if (loco) DCC::setThrottle(loco,0,DCC::getThrottleDirection(loco));
+      delayMe(500);
+      return;
+    }
+    setFlag(operand,SECTION_FLAG);
+    break;
     
   case OPCODE_FREE:
     setFlag(operand,0,SECTION_FLAG);
