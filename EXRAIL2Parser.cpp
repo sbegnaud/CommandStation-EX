@@ -219,6 +219,9 @@ bool RMFT2::parseSlash(Print * stream, byte & paramCount, int16_t p[]) {
               case OPCODE_RESERVE:
                 StringFormatter::send(stream,F(" WAIT RESERVE %d"),operand);
                 break;
+                case OPCODE_SRESERVE:
+                StringFormatter::send(stream,F(" WAIT SRESERVE %d"),operand);
+                break;
               case OPCODE_AT:
               case OPCODE_ATTIMEOUT2:
               case OPCODE_AFTER:
@@ -341,6 +344,9 @@ bool RMFT2::parseSlash(Print * stream, byte & paramCount, int16_t p[]) {
     return false;
     
   case "RESERVE"_hk:  // force reserve a section
+    return setFlag(p[1],SECTION_FLAG);
+   
+  case "SRESERVE"_hk:  // force reserve a section
     return setFlag(p[1],SECTION_FLAG);
     
   case "FREE"_hk:  // force free a section
