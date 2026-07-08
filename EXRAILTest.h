@@ -45,6 +45,14 @@ ROUTE(7000, "Route state tests")
   PARSE("</>")
   FREEALL
   PARSE("</>")
+  
+// TEST new FREEALL command
+  ROUTE(7200,"7200 Test FREEALL")
+  SRESERVE(1)
+  SRESERVE(255)
+  PARSE("</>")
+  FREEALL
+  PARSE("</>")
 
   IFRESERVE(1)
     PRINT("7200 FREEALL test worked")
