@@ -1,0 +1,442 @@
+// =============================================================================
+// myIO_RS485Bus.h  —  DCC-EX HAL Driver for RS-485 Node Bus
+// =============================================================================
+//
+// Polled RS-485 master bus for DCC-EX EX-CommandStation (CSB1).
+//
+// NOTE: filename begins with "my" so EXInstaller treats it as a user config
+// file and picks it up from its separate user-config storage location.
+//
+// HARDWARE (no level shifters):
+//   CSB1 Serial2 (GPIO16 RX / GPIO17 TX, GPIO4 DE/RE) -> MAX3082 (3.3V)
+//   -> RS-485 bus -> MAX485 (5V) -> ATmega328P/Pro Mini (5V) -> PCA9685 -> servos
+//
+// REGISTER in myAutomation.h (this CSB1 uses the EXRAIL HAL() form):
+//   #include "myIO_RS485Bus.h"
+//   HAL(RS485Bus, RS485_FIRST_VPIN, RS485_VPIN_COUNT)
+//
+// FILES IN CommandStation-EX FOLDER:
+//   myIO_RS485Bus.h    — this file (never edit)
+//   myRS485Config.h    — bus hardware + node registry (edit this)
+//   myRS485Turnouts.h  — vpin map data rows
+//   myTurnouts.h       — EXRAIL PIN_TURNOUT definitions
+//   myAutomation.h     — HAL_IGNORE_DEFAULTS, HAL() line, includes the above
+//
+// PROTOCOL (half-duplex, master-initiated):
+//   Master -> Node:  <N addr POLL>                      heartbeat
+//   Master -> Node:  <N addr T turnoutID state>          throw/close (1/0)
+//   Master -> Node:  <N addr TUNE turnoutID pwm>         move to pwm, no save
+//   Master -> Node:  <N addr SAVE turnoutID C pwm>       save closed position
+//   Master -> Node:  <N addr SAVE turnoutID T pwm>       save thrown position
+//   Master -> Node:  <N addr RESET turnoutID>            revert to myConfig.h
+//   Master -> Node:  <N addr QUERY turnoutID>            report positions
+//
+//   Node -> Master:  <A addr OK>                         heartbeat ACK
+//   Node -> Master:  <A addr T turnoutID state>          command ACK
+//   Node -> Master:  <A addr Q turnoutID closed thrown>  query response
+//
+// =============================================================================
+
+#ifndef IO_RS485BUS_H
+#define IO_RS485BUS_H
+
+#include "IODevice.h"
+#include "DIAG.h"
+#include "myRS485Config.h"
+
+class RS485Bus : public IODevice {
+
+public:
+
+  // create() — called by the HAL() macro. Signature must match
+  // HAL(RS485Bus, firstVpin, nPins) exactly.
+  static void create(VPIN firstVpin, int nPins) {
+    if (checkNoOverlap(firstVpin, nPins))
+      new RS485Bus(firstVpin, nPins);
+  }
+
+private:
+
+  RS485Bus(VPIN firstVpin, int nPins) : IODevice(firstVpin, nPins) {
+    for (uint8_t i = 0; i < RS485_NODE_COUNT; i++) {
+      _nodeRuntime[i].online        = false;
+      _nodeRuntime[i].missedPolls   = 0;
+      _nodeRuntime[i].lastPollTime  = 0;
+      _nodeRuntime[i].waitingForAck = false;
+      _nodeRuntime[i].sensorBits    = 0;
+    }
+    _currentNodeIdx = 0;
+    _rxPos          = 0;
+    _inCommand      = false;
+    _ackPending     = false;
+    _ackNodeIdx     = 0;
+    _pendingCount   = 0;
+    addDevice(this);
+  }
+
+  // ---------------------------------------------------------------------------
+  // _begin() — called once at startup
+  // ---------------------------------------------------------------------------
+  void _begin() override {
+    RS485_SERIAL.begin(RS485_BAUD, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
+    pinMode(RS485_DE_RE_PIN, OUTPUT);
+    _setReceive();
+    DIAG(F("RS485Bus: started baud=%d nodes=%d vpins=%d-%d"),
+         RS485_BAUD, RS485_NODE_COUNT,
+         _firstVpin, _firstVpin + _nPins - 1);
+    _deviceState = DEVSTATE_NORMAL;
+  }
+
+  // ---------------------------------------------------------------------------
+  // _loop() — called every DCC-EX cycle
+  //
+  //   1. Drain incoming serial (non-blocking)
+  //   2. If waiting on an ACK, check timeout only
+  //   3. Pending commands are sent IMMEDIATELY (not gated by poll interval)
+  //   4. Otherwise, heartbeat-poll nodes on their interval
+  // ---------------------------------------------------------------------------
+  void _loop(unsigned long currentMicros) override {
+
+    _readIncoming();
+
+    if (_ackPending) {
+      if (currentMicros - _ackSentTime > RS485_TIMEOUT_US)
+        _handleTimeout();
+      return;
+    }
+
+    // Pending commands take priority — sent on the next loop pass, no wait.
+    if (_pendingCount > 0) {
+      uint8_t nodeIdx = _pending[0].nodeIdx;
+      _sendTurnoutCommand(nodeIdx, 0);
+      delayUntil(currentMicros + RS485_TIMEOUT_US);
+      return;
+    }
+
+    // No pending commands: heartbeat-poll on each node's interval.
+    for (uint8_t scanned = 0; scanned < RS485_NODE_COUNT; scanned++) {
+      uint8_t i = _currentNodeIdx;
+      _currentNodeIdx = (i + 1) % RS485_NODE_COUNT;
+
+      if (currentMicros - _nodeRuntime[i].lastPollTime
+          >= RS485_NODES[i].pollInterval) {
+        _nodeRuntime[i].lastPollTime = currentMicros;
+        _sendPoll(i);
+        delayUntil(currentMicros + RS485_TIMEOUT_US);
+        return;
+      }
+    }
+    delayUntil(currentMicros + 1000UL);
+  }
+
+  // ---------------------------------------------------------------------------
+  // _write() — DCC-EX calls this when a PIN_TURNOUT is thrown(1) or closed(0)
+  // ---------------------------------------------------------------------------
+  void _write(VPIN vpin, int value) override {
+    const VpinMap* m = _findVpinMap(vpin);
+    if (!m) return;
+    int8_t nodeIdx = _nodeIndexForAddress(m->nodeAddress);
+    if (nodeIdx < 0) return;
+    _queueCommand(vpin, (uint8_t)nodeIdx, m->turnoutID, (uint8_t)value);
+  }
+
+  // _read() serves SENSOR vpins only. Turnout state is owned by DCC-EX, not
+  // stored here. For a sensor vpin, find the owning sensor node and return the
+  // corresponding bit from that node's last reported value (1 = occupied).
+  // Any vpin that isn't a mapped sensor bit returns 0.
+  int _read(VPIN vpin) override {
+    for (uint8_t i = 0; i < RS485_SENSOR_MAP_COUNT; i++) {
+      VPIN first = RS485_SENSOR_MAP[i].firstVpin;
+      if (vpin >= first && vpin < first + 16) {
+        int8_t nodeIdx = _nodeIndexForAddress(RS485_SENSOR_MAP[i].nodeAddress);
+        if (nodeIdx < 0) return 0;
+        uint8_t bit = vpin - first;
+        return (_nodeRuntime[nodeIdx].sensorBits >> bit) & 0x01;
+      }
+    }
+    return 0;
+  }
+
+  // ---------------------------------------------------------------------------
+  // _display() — output for <D HAL SHOW> (on-demand, not automatic)
+  // ---------------------------------------------------------------------------
+  void _display() override {
+    DIAG(F("RS485Bus Vpins:%d-%d nodes=%d"),
+         _firstVpin, _firstVpin + _nPins - 1, RS485_NODE_COUNT);
+    for (uint8_t i = 0; i < RS485_NODE_COUNT; i++) {
+      DIAG(F("  Node %d [%S] %S missed=%d"),
+           RS485_NODES[i].address,
+           RS485_NODES[i].type == NODE_SERVO ? F("SERVO") : F("SENSOR"),
+           _nodeRuntime[i].online ? F("ONLINE") : F("OFFLINE"),
+           _nodeRuntime[i].missedPolls);
+    }
+  }
+
+  // ===========================================================================
+  // BUS DIRECTION
+  // ===========================================================================
+  void _setTransmit() {
+    digitalWrite(RS485_DE_RE_PIN, HIGH);
+    delayMicroseconds(RS485_DE_SETTLE_US);
+  }
+  void _setReceive() {
+    RS485_SERIAL.flush();
+    delayMicroseconds(RS485_DE_SETTLE_US);
+    digitalWrite(RS485_DE_RE_PIN, LOW);
+  }
+
+  // ===========================================================================
+  // SEND — private
+  // ===========================================================================
+  void _sendPoll(uint8_t nodeIdx) {
+    _setTransmit();
+    RS485_SERIAL.print(F("<N "));
+    RS485_SERIAL.print(RS485_NODES[nodeIdx].address);
+    RS485_SERIAL.print(F(" POLL>"));
+    _setReceive();
+    _startAckWait(nodeIdx);
+  }
+
+  void _sendTurnoutCommand(uint8_t nodeIdx, int8_t cmdIdx) {
+    _setTransmit();
+    RS485_SERIAL.print(F("<N "));
+    RS485_SERIAL.print(RS485_NODES[nodeIdx].address);
+    RS485_SERIAL.print(F(" T "));
+    RS485_SERIAL.print(_pending[cmdIdx].turnoutID);
+    RS485_SERIAL.print(F(" "));
+    RS485_SERIAL.print(_pending[cmdIdx].value);
+    RS485_SERIAL.print(F(">"));
+    _setReceive();
+    _removePending(cmdIdx);
+    _startAckWait(nodeIdx);
+  }
+
+  // ===========================================================================
+  // SEND — public tuning commands (used later, from serial monitor or a filter)
+  // ===========================================================================
+public:
+  void sendTune(uint8_t nodeAddr, uint16_t turnoutID, uint16_t pwmValue) {
+    int8_t idx = _nodeIndexForAddress(nodeAddr);
+    if (idx < 0) return;
+    _setTransmit();
+    RS485_SERIAL.print(F("<N ")); RS485_SERIAL.print(nodeAddr);
+    RS485_SERIAL.print(F(" TUNE ")); RS485_SERIAL.print(turnoutID);
+    RS485_SERIAL.print(F(" ")); RS485_SERIAL.print(pwmValue);
+    RS485_SERIAL.print(F(">"));
+    _setReceive();
+    _startAckWait(idx);
+  }
+  void sendSave(uint8_t nodeAddr, uint16_t turnoutID, char posType, uint16_t pwmValue) {
+    int8_t idx = _nodeIndexForAddress(nodeAddr);
+    if (idx < 0) return;
+    _setTransmit();
+    RS485_SERIAL.print(F("<N ")); RS485_SERIAL.print(nodeAddr);
+    RS485_SERIAL.print(F(" SAVE ")); RS485_SERIAL.print(turnoutID);
+    RS485_SERIAL.print(F(" ")); RS485_SERIAL.print(posType);
+    RS485_SERIAL.print(F(" ")); RS485_SERIAL.print(pwmValue);
+    RS485_SERIAL.print(F(">"));
+    _setReceive();
+    _startAckWait(idx);
+  }
+  void sendReset(uint8_t nodeAddr, uint16_t turnoutID) {
+    int8_t idx = _nodeIndexForAddress(nodeAddr);
+    if (idx < 0) return;
+    _setTransmit();
+    RS485_SERIAL.print(F("<N ")); RS485_SERIAL.print(nodeAddr);
+    RS485_SERIAL.print(F(" RESET ")); RS485_SERIAL.print(turnoutID);
+    RS485_SERIAL.print(F(">"));
+    _setReceive();
+    _startAckWait(idx);
+  }
+  void sendQuery(uint8_t nodeAddr, uint16_t turnoutID) {
+    int8_t idx = _nodeIndexForAddress(nodeAddr);
+    if (idx < 0) return;
+    _setTransmit();
+    RS485_SERIAL.print(F("<N ")); RS485_SERIAL.print(nodeAddr);
+    RS485_SERIAL.print(F(" QUERY ")); RS485_SERIAL.print(turnoutID);
+    RS485_SERIAL.print(F(">"));
+    _setReceive();
+    _startAckWait(idx);
+  }
+private:
+
+  // ===========================================================================
+  // RECEIVE
+  // ===========================================================================
+  void _readIncoming() {
+    while (RS485_SERIAL.available()) {
+      char c = RS485_SERIAL.read();
+      if (c == '<') {
+        _inCommand = true;
+        _rxPos = 0;
+      } else if (c == '>' && _inCommand) {
+        _rxBuf[_rxPos] = '\0';
+        _inCommand = false;
+        _parseResponse(_rxBuf);
+      } else if (_inCommand) {
+        if (_rxPos < RS485_RX_BUFSIZE - 1) _rxBuf[_rxPos++] = c;
+        else { _inCommand = false; _rxPos = 0; }
+      }
+    }
+  }
+
+  void _parseResponse(const char* buf) {
+    // All fields parsed as unsigned int to match sscanf's %u exactly (avoids
+    // a format/pointer-size mismatch warning, and the undefined behavior it
+    // could cause). Narrowed to uint8_t/uint16_t where used below.
+    unsigned int addr, turnoutID, closedPWM, thrownPWM;
+    unsigned int stateVal;
+    unsigned int sensorCount, sensorBits;
+
+    // Heartbeat ACK: "A addr OK"
+    if (sscanf(buf, "A %u OK", &addr) == 1) {
+      int8_t idx = _nodeIndexForAddress((uint8_t)addr);
+      if (idx < 0) return;
+      _ackPending = false;
+      _nodeRuntime[idx].waitingForAck = false;
+      _nodeRuntime[idx].missedPolls   = 0;
+      if (!_nodeRuntime[idx].online) {
+        _nodeRuntime[idx].online = true;
+        DIAG(F("RS485Bus: Node %d ONLINE"), addr);
+      }
+      return;
+    }
+
+    // Command ACK: "A addr T turnoutID state"
+    // We only use this to confirm the node is alive and clear the ACK wait.
+    // Turnout state itself is owned by DCC-EX — nothing to store here.
+    if (sscanf(buf, "A %u T %u %u", &addr, &turnoutID, &stateVal) == 3) {
+      int8_t idx = _nodeIndexForAddress((uint8_t)addr);
+      if (idx < 0) return;
+      _ackPending = false;
+      _nodeRuntime[idx].waitingForAck = false;
+      _nodeRuntime[idx].missedPolls   = 0;
+      if (!_nodeRuntime[idx].online) {
+        _nodeRuntime[idx].online = true;
+        DIAG(F("RS485Bus: Node %d ONLINE"), addr);
+      }
+      return;
+    }
+
+    // Block-state reply (sensor node): "A addr B count value"
+    //   count = number of sensors this node watches (clamped to 16)
+    //   value = packed bits, bit i set = sensor i+1 OCCUPIED
+    // Stored compactly in this node's runtime (16 bits). _read(vpin) resolves
+    // a sensor vpin back to (node, bit) on demand, so no dense array is needed.
+    if (sscanf(buf, "A %u B %u %u", &addr, &sensorCount, &sensorBits) == 3) {
+      int8_t idx = _nodeIndexForAddress((uint8_t)addr);
+      if (idx < 0) return;
+      _ackPending = false;
+      _nodeRuntime[idx].waitingForAck = false;
+      _nodeRuntime[idx].missedPolls   = 0;
+      if (!_nodeRuntime[idx].online) {
+        _nodeRuntime[idx].online = true;
+        DIAG(F("RS485Bus: Node %d ONLINE"), addr);
+      }
+      // Clamp count to 16, keep only the valid bits, store on the node.
+      if (sensorCount > 16) sensorCount = 16;
+      uint16_t mask = (sensorCount >= 16) ? 0xFFFF
+                                          : (uint16_t)((1u << sensorCount) - 1);
+      _nodeRuntime[idx].sensorBits = (uint16_t)sensorBits & mask;
+      return;
+    }
+
+    // Query response: "A addr Q turnoutID closedPWM thrownPWM"
+    if (sscanf(buf, "A %u Q %u %u %u",
+               &addr, &turnoutID, &closedPWM, &thrownPWM) == 4) {
+      _ackPending = false;
+      DIAG(F("RS485Bus: Node %d turnout %d closed=%d thrown=%d"),
+           addr, turnoutID, closedPWM, thrownPWM);
+      return;
+    }
+  }
+
+  // ===========================================================================
+  // ACK / TIMEOUT
+  // ===========================================================================
+  void _startAckWait(uint8_t nodeIdx) {
+    _ackPending  = true;
+    _ackNodeIdx  = nodeIdx;
+    _ackSentTime = micros();
+    _nodeRuntime[nodeIdx].waitingForAck = true;
+  }
+
+  void _handleTimeout() {
+    _ackPending = false;
+    _nodeRuntime[_ackNodeIdx].waitingForAck = false;
+    _nodeRuntime[_ackNodeIdx].missedPolls++;
+    if (_nodeRuntime[_ackNodeIdx].missedPolls >= RS485_OFFLINE_THRESHOLD
+        && _nodeRuntime[_ackNodeIdx].online) {
+      _nodeRuntime[_ackNodeIdx].online = false;
+      DIAG(F("RS485Bus: Node %d OFFLINE"), RS485_NODES[_ackNodeIdx].address);
+    }
+  }
+
+  // ===========================================================================
+  // PENDING QUEUE
+  // ===========================================================================
+  void _queueCommand(VPIN vpin, uint8_t nodeIdx, uint16_t turnoutID, uint8_t value) {
+    for (uint8_t i = 0; i < _pendingCount; i++) {
+      if (_pending[i].vpin == vpin) { _pending[i].value = value; return; }
+    }
+    if (_pendingCount >= RS485_MAX_PENDING) return;
+    _pending[_pendingCount++] = { vpin, nodeIdx, turnoutID, value };
+  }
+
+  int8_t _findPendingCommand(uint8_t nodeIdx) {
+    for (uint8_t i = 0; i < _pendingCount; i++)
+      if (_pending[i].nodeIdx == nodeIdx) return (int8_t)i;
+    return -1;
+  }
+
+  void _removePending(uint8_t idx) {
+    for (uint8_t i = idx; i < _pendingCount - 1; i++)
+      _pending[i] = _pending[i + 1];
+    _pendingCount--;
+  }
+
+  // ===========================================================================
+  // LOOKUPS
+  // ===========================================================================
+  int8_t _nodeIndexForAddress(uint8_t address) {
+    for (uint8_t i = 0; i < RS485_NODE_COUNT; i++)
+      if (RS485_NODES[i].address == address) return (int8_t)i;
+    return -1;
+  }
+  const VpinMap* _findVpinMap(VPIN vpin) {
+    for (uint8_t i = 0; i < RS485_VPIN_MAP_COUNT; i++)
+      if (RS485_VPIN_MAP[i].vpin == vpin) return &RS485_VPIN_MAP[i];
+    return nullptr;
+  }
+
+  // ===========================================================================
+  // INSTANCE DATA
+  // ===========================================================================
+  struct NodeRuntime {
+    bool     online;
+    bool     waitingForAck;
+    uint8_t  missedPolls;
+    uint32_t lastPollTime;
+    uint16_t sensorBits;    // last reported occupancy (sensor nodes; bit=occupied)
+  };
+  NodeRuntime _nodeRuntime[RS485_NODE_COUNT];
+
+  struct PendingCmd {
+    VPIN     vpin;
+    uint8_t  nodeIdx;
+    uint16_t turnoutID;
+    uint8_t  value;
+  };
+  PendingCmd _pending[RS485_MAX_PENDING];
+  uint8_t    _pendingCount;
+
+  uint8_t  _currentNodeIdx;
+  bool     _ackPending;
+  uint8_t  _ackNodeIdx;
+  uint32_t _ackSentTime;
+  char     _rxBuf[RS485_RX_BUFSIZE];
+  uint8_t  _rxPos;
+  bool     _inCommand;
+};
+
+#endif // IO_RS485BUS_H
